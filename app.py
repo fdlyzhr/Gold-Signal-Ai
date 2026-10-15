@@ -7,7 +7,7 @@ import plotly.graph_objects as go
 from datetime import datetime, timezone
 
 # =========================================================
-# PAGE CONFIGURATION
+# CONFIGURATION
 # =========================================================
 st.set_page_config(
     page_title="Gold Signal AI",
@@ -16,56 +16,8 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# =========================================================
-# DARK PURPLE THEME
-# =========================================================
-st.markdown("""
-<style>
-.stApp {
-    background: #0b0913;
-    color: #f0edf8;
-}
-[data-testid="stSidebar"] {
-    background: #171127;
-    border-right: 1px solid #302442;
-}
-h1, h2, h3 {
-    color: #f5f0ff !important;
-}
-[data-testid="stMetric"] {
-    background: #171127;
-    border: 1px solid #302442;
-    padding: 16px;
-    border-radius: 12px;
-}
-div[data-testid="stDataFrame"] {
-    border: 1px solid #302442;
-    border-radius: 8px;
-}
-div.stButton > button {
-    background: #7047eb;
-    color: white;
-    border: 0;
-    border-radius: 8px;
-}
-div.stButton > button:hover {
-    background: #8a68ff;
-    color: white;
-}
-div[data-testid="stAlert"] {
-    border-radius: 8px;
-}
-.small-muted {
-    color: #a59ab9;
-    font-size: 12px;
-}
-</style>
-""", unsafe_allow_html=True)
-
-# =========================================================
-# SETTINGS
-# =========================================================
-API_BASE = "https://biquote.io/api/XAUUSD/ohlc"
+API_URL = "https://biquote.io/api/XAUUSD/ohlc"
+QUOTE_URL = "https://biquote.io/api/XAUUSD"
 
 TIMEFRAMES = {
     "M1": "1m",
@@ -77,98 +29,115 @@ TIMEFRAMES = {
 }
 
 STRATEGIES = [
-    "Scalping",
+    "Trend Pullback",
     "Engulfing",
     "Support & Resistance",
     "Breakout",
 ]
 
 # =========================================================
-# DATA FETCHING
+# STYLE
+# =========================================================
+st.markdown("""
+<style>
+.stApp {background:#0b0913;color:#f0edf8}
+[data-testid="stSidebar"] {
+    background:#171127;
+    border-right:1px solid #302442;
+}
+h1,h2,h3 {color:#f5f0ff !important}
+[data-testid="stMetric"] {
+    background:#171127;
+    border:1px solid #302442;
+    padding:14px;
+    border-radius:12px;
+}
+div[data-testid="stDataFrame"] {
+    border:1px solid #302442;
+    border-radius:8px;
+}
+div.stButton>button {
+    background:#7047eb;color:white;border:0;border-radius:8px;
+}
+div.stButton>button:hover {background:#8a68ff;color:white}
+</style>
+""", unsafe_allow_html=True)
+
+
+# =========================================================
+# MARKET DATA
 # =========================================================
 @st.cache_data(ttl=10, show_spinner=False)
 def fetch_candles(interval, limit=300):
-    """
-    Fetch XAUUSD OHLC candles from Biquote.
-    Returns (DataFrame, error_message).
-    """
     try:
-        response = requests.get(
-            API_BASE,
+        r = requests.get(
+            API_URL,
             params={"interval": interval, "limit": limit},
-            headers={"Accept": "application/json"},
             timeout=15,
+            headers={"Accept": "application/json"},
         )
+        r.raise_for_status()
+        payload = r.json()
 
-        if response.status_code != 200:
+        bars = payload.get("bars", []) if isinstance(payload, dict) else []
+        if not bars:
             return pd.DataFrame(), (
-                f"API HTTP {response.status_code}: "
-                f"{response.text[:250]}"
-            )
-
-        payload = response.json()
-
-        if not isinstance(payload, dict):
-            return pd.DataFrame(), "Unexpected API response format."
-
-        bars = payload.get("bars", [])
-
-        if not isinstance(bars, list) or len(bars) == 0:
-            return pd.DataFrame(), (
-                "The API returned no candle bars. "
-                f"Response: {str(payload)[:250]}"
+                f"No candles returned for interval {interval}. "
+                f"Response: {str(payload)[:180]}"
             )
 
         df = pd.DataFrame(bars)
 
-        required = ["openTime", "open", "high", "low", "close"]
-        missing = [column for column in required
-                   if column not in df.columns]
+        # Accommodate common timestamp field names.
+        time_col = next(
+            (c for c in ["openTime", "time", "timestamp", "t"]
+             if c in df.columns),
+            None,
+        )
 
-        if missing:
+        if time_col is None:
             return pd.DataFrame(), (
-                f"Missing API fields: {missing}. "
-                f"Received fields: {list(df.columns)}"
+                f"No timestamp field. Received: {list(df.columns)}"
             )
 
-        df["time"] = pd.to_datetime(
-            df["openTime"], utc=True, errors="coerce"
-        )
+        required = ["open", "high", "low", "close"]
+        missing = [c for c in required if c not in df.columns]
+        if missing:
+            return pd.DataFrame(), f"Missing fields: {missing}"
 
-        for column in ["open", "high", "low", "close"]:
-            df[column] = pd.to_numeric(
-                df[column], errors="coerce"
+        raw_time = df[time_col]
+
+        # Unix timestamps may be in seconds or milliseconds.
+        if pd.api.types.is_numeric_dtype(raw_time):
+            valid_times = raw_time.dropna()
+            unit = "ms" if (
+                not valid_times.empty
+                and valid_times.abs().median() > 1e11
+            ) else "s"
+            df["time"] = pd.to_datetime(
+                raw_time, unit=unit, utc=True, errors="coerce"
+            )
+        else:
+            df["time"] = pd.to_datetime(
+                raw_time, utc=True, errors="coerce"
             )
 
-        df = df.dropna(
-            subset=["time", "open", "high", "low", "close"]
-        )
+        for c in required:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
 
-        # API may return newest candles first.
-        df = (
-            df.sort_values("time")
-            .drop_duplicates(subset=["time"])
-            .reset_index(drop=True)
-        )
+        df = df.dropna(subset=["time"] + required)
+        df = df.sort_values("time")
+        df = df.drop_duplicates("time")
 
-        # Do not calculate signals from the unfinished candle.
+        # Remove provider-marked unfinished candles.
         if "isOpen" in df.columns:
-            open_flags = (
-                df["isOpen"]
-                .astype(str)
-                .str.lower()
+            unfinished = (
+                df["isOpen"].astype(str).str.lower()
                 .isin(["true", "1"])
             )
-            df = df.loc[~open_flags].copy()
+            df = df.loc[~unfinished]
 
-        df = df.reset_index(drop=True)
-
-        if df.empty:
-            return pd.DataFrame(), (
-                "No completed candles are available."
-            )
-
-        # Basic OHLC sanity check.
+        # Reject malformed OHLC bars.
         valid = (
             (df["high"] >= df["low"])
             & (df["high"] >= df["open"])
@@ -176,293 +145,369 @@ def fetch_candles(interval, limit=300):
             & (df["low"] <= df["open"])
             & (df["low"] <= df["close"])
         )
-
         df = df.loc[valid].reset_index(drop=True)
 
-        if len(df) < 30:
+        if len(df) < 60:
             return df, (
-                f"Only {len(df)} completed candles received; "
-                "at least 30 are needed for reliable calculations."
+                f"Only {len(df)} candles available; "
+                "at least 60 are required."
             )
 
         return df, None
 
     except requests.exceptions.Timeout:
-        return pd.DataFrame(), "Request timed out. Try refreshing."
-    except requests.exceptions.RequestException as exc:
-        return pd.DataFrame(), f"Network request failed: {exc}"
-    except ValueError as exc:
-        return pd.DataFrame(), f"Invalid JSON response: {exc}"
-    except Exception as exc:
-        return pd.DataFrame(), f"Unexpected data error: {exc}"
+        return pd.DataFrame(), "API timed out."
+    except requests.exceptions.RequestException as e:
+        return pd.DataFrame(), f"Network/API error: {e}"
+    except Exception as e:
+        return pd.DataFrame(), f"Data error: {e}"
 
 
 @st.cache_data(ttl=10, show_spinner=False)
-def fetch_live_quote():
-    """Fetch the latest available XAUUSD quote."""
+def fetch_quote():
     try:
-        response = requests.get(
-            "https://biquote.io/api/XAUUSD",
-            timeout=10,
-        )
-        response.raise_for_status()
-        data = response.json()
+        r = requests.get(QUOTE_URL, timeout=10)
+        r.raise_for_status()
+        data = r.json()
 
-        price = data.get("mid") or data.get("bid") or data.get("ask")
-        if price is None:
-            return None, "Quote response did not contain a price."
+        for key in ["mid", "price", "last", "bid", "ask"]:
+            if data.get(key) is not None:
+                return float(data[key]), None
 
-        return float(price), None
-
-    except Exception as exc:
-        return None, str(exc)
+        return None, f"Quote fields not recognized: {str(data)[:180]}"
+    except Exception as e:
+        return None, str(e)
 
 
 # =========================================================
-# TECHNICAL INDICATORS
+# INDICATORS
 # =========================================================
 def add_indicators(df):
     df = df.copy()
 
-    df["ema9"] = df["close"].ewm(
-        span=9, adjust=False
-    ).mean()
-
-    df["ema20"] = df["close"].ewm(
-        span=20, adjust=False
-    ).mean()
-
-    df["ema50"] = df["close"].ewm(
-        span=50, adjust=False
-    ).mean()
+    df["ema9"] = df["close"].ewm(span=9, adjust=False).mean()
+    df["ema20"] = df["close"].ewm(span=20, adjust=False).mean()
+    df["ema50"] = df["close"].ewm(span=50, adjust=False).mean()
+    df["ema200"] = df["close"].ewm(span=200, adjust=False).mean()
 
     df["sma20"] = df["close"].rolling(20).mean()
     df["std20"] = df["close"].rolling(20).std()
-
     df["bb_upper"] = df["sma20"] + 2 * df["std20"]
     df["bb_lower"] = df["sma20"] - 2 * df["std20"]
 
-    previous_close = df["close"].shift(1)
+    prev_close = df["close"].shift(1)
+    tr = pd.concat([
+        df["high"] - df["low"],
+        (df["high"] - prev_close).abs(),
+        (df["low"] - prev_close).abs(),
+    ], axis=1).max(axis=1)
 
-    true_range = pd.concat(
-        [
-            df["high"] - df["low"],
-            (df["high"] - previous_close).abs(),
-            (df["low"] - previous_close).abs(),
-        ],
-        axis=1,
-    ).max(axis=1)
+    df["atr"] = tr.rolling(14).mean()
 
-    df["atr14"] = true_range.rolling(14).mean()
+    # RSI
+    delta = df["close"].diff()
+    gain = delta.clip(lower=0).ewm(
+        alpha=1 / 14, adjust=False
+    ).mean()
+    loss = -delta.clip(upper=0).ewm(
+        alpha=1 / 14, adjust=False
+    ).mean()
+
+    rs = gain / loss.replace(0, np.nan)
+    df["rsi"] = 100 - (100 / (1 + rs))
+
+    # Volume is optional; do not fabricate it.
+    if "volume" in df.columns:
+        df["volume"] = pd.to_numeric(
+            df["volume"], errors="coerce"
+        )
 
     return df
 
 
-def get_trend(df):
-    if len(df) < 50:
+def trend_of(df):
+    if len(df) < 55:
         return "Unknown"
 
-    last = df.iloc[-1]
-
-    if pd.isna(last["ema20"]) or pd.isna(last["ema50"]):
+    x = df.iloc[-1]
+    if pd.isna(x["ema20"]) or pd.isna(x["ema50"]):
         return "Unknown"
 
-    if last["close"] > last["ema20"] > last["ema50"]:
+    if x["close"] > x["ema20"] > x["ema50"]:
         return "Bullish"
-
-    if last["close"] < last["ema20"] < last["ema50"]:
+    if x["close"] < x["ema20"] < x["ema50"]:
         return "Bearish"
+    return "Neutral"
 
-    return "Sideways"
 
-
-# =========================================================
-# SUPPORT AND RESISTANCE
-# =========================================================
-def get_support_resistance(df, lookback=40):
-    recent = df.tail(lookback)
-
-    if recent.empty:
+def sr_levels(df, lookback=40):
+    recent = df.iloc[-lookback-1:-1]
+    if len(recent) < 10:
         return None, None
-
-    support = float(recent["low"].min())
-    resistance = float(recent["high"].max())
-
-    return support, resistance
+    return float(recent["low"].min()), float(recent["high"].max())
 
 
 # =========================================================
-# SIGNAL ENGINE
+# HIGH-QUALITY SETUP ENGINE
 # =========================================================
-def evaluate_strategy(df, strategy, rr_target=2.0):
+def score_setup(df, strategy, higher_trends, min_rr=2.0):
     """
-    Educational technical-rule engine.
-    Returns one dictionary per timeframe/strategy.
+    Returns a setup score and proposed levels.
+    The score is a rule-based filter, not a win probability.
     """
-    result = {
+    out = {
         "Signal": "WAIT",
-        "Trend": get_trend(df),
+        "Score": 0,
+        "Quality": "No setup",
+        "Trend": trend_of(df),
         "Entry": None,
         "Stop Loss": None,
         "TP1": None,
         "TP2": None,
         "TP3": None,
-        "Reason": "Rules not met",
+        "RR": None,
+        "Reason": "",
     }
 
-    if len(df) < 55:
-        result["Reason"] = "Not enough completed candles"
-        return result
+    if len(df) < 60:
+        out["Reason"] = "Insufficient candle history"
+        return out
 
-    last = df.iloc[-1]
-    previous = df.iloc[-2]
+    x = df.iloc[-1]
+    p = df.iloc[-2]
 
-    price = float(last["close"])
-    atr = last["atr14"]
+    price = float(x["close"])
+    atr = x["atr"]
+    rsi = x["rsi"]
 
-    if pd.isna(atr) or not np.isfinite(atr) or atr <= 0:
-        result["Reason"] = "ATR is unavailable"
-        return result
+    if pd.isna(atr) or pd.isna(rsi) or atr <= 0:
+        out["Reason"] = "Indicators unavailable"
+        return out
 
     atr = float(atr)
-    trend = result["Trend"]
+    rsi = float(rsi)
+    trend = out["Trend"]
 
-    bullish_engulfing = (
-        previous["close"] < previous["open"]
-        and last["close"] > last["open"]
-        and last["open"] <= previous["close"]
-        and last["close"] >= previous["open"]
+    # Higher-timeframe consensus.
+    usable_trends = [
+        t for t in higher_trends if t in ["Bullish", "Bearish"]
+    ]
+    bull_count = usable_trends.count("Bullish")
+    bear_count = usable_trends.count("Bearish")
+
+    htf_bull = bull_count >= 1 and bull_count > bear_count
+    htf_bear = bear_count >= 1 and bear_count > bull_count
+
+    # Avoid very small candles and extreme candle spikes.
+    candle_range = float(x["high"] - x["low"])
+    body = abs(float(x["close"] - x["open"]))
+    body_ratio = body / candle_range if candle_range > 0 else 0
+
+    volatility_ok = 0.0001 * price < atr < 0.02 * price
+    candle_size_ok = candle_range < 2.5 * atr
+
+    bull_engulf = (
+        p["close"] < p["open"]
+        and x["close"] > x["open"]
+        and x["open"] <= p["close"]
+        and x["close"] >= p["open"]
     )
 
-    bearish_engulfing = (
-        previous["close"] > previous["open"]
-        and last["close"] < last["open"]
-        and last["open"] >= previous["close"]
-        and last["close"] <= previous["open"]
+    bear_engulf = (
+        p["close"] > p["open"]
+        and x["close"] < x["open"]
+        and x["open"] >= p["close"]
+        and x["close"] <= p["open"]
     )
 
-    support, resistance = get_support_resistance(
-        df.iloc[:-1], lookback=40
-    )
-
+    support, resistance = sr_levels(df, 40)
     buy = False
     sell = False
-    reason = ""
+    reasons = []
 
-    # 1. SCALPING
-    if strategy == "Scalping":
+    # Each strategy defines a potential trigger.
+    if strategy == "Trend Pullback":
         buy = (
-            last["ema9"] > last["ema20"]
-            and last["close"] > last["ema9"]
-            and trend == "Bullish"
+            trend == "Bullish"
+            and htf_bull
+            and x["low"] <= x["ema20"] + 0.25 * atr
+            and x["close"] > x["ema20"]
+            and x["close"] > x["open"]
         )
         sell = (
-            last["ema9"] < last["ema20"]
-            and last["close"] < last["ema9"]
-            and trend == "Bearish"
+            trend == "Bearish"
+            and htf_bear
+            and x["high"] >= x["ema20"] - 0.25 * atr
+            and x["close"] < x["ema20"]
+            and x["close"] < x["open"]
         )
-        reason = "EMA 9/20 momentum with trend filter"
+        reasons.append("EMA20 pullback")
 
-    # 2. ENGULFING
     elif strategy == "Engulfing":
-        buy = bullish_engulfing and trend != "Bearish"
-        sell = bearish_engulfing and trend != "Bullish"
-        reason = "Engulfing candle with trend filter"
+        buy = bull_engulf and trend == "Bullish" and htf_bull
+        sell = bear_engulf and trend == "Bearish" and htf_bear
+        reasons.append("Engulfing with aligned trend")
 
-    # 3. SUPPORT & RESISTANCE
     elif strategy == "Support & Resistance":
-        tolerance = max(atr * 0.35, price * 0.0002)
+        tolerance = max(0.35 * atr, price * 0.0002)
 
         buy = (
             support is not None
-            and abs(float(last["low"]) - support) <= tolerance
-            and last["close"] > last["open"]
+            and abs(float(x["low"]) - support) <= tolerance
+            and x["close"] > x["open"]
+            and trend == "Bullish"
+            and htf_bull
         )
-
         sell = (
             resistance is not None
-            and abs(float(last["high"]) - resistance) <= tolerance
-            and last["close"] < last["open"]
+            and abs(float(x["high"]) - resistance) <= tolerance
+            and x["close"] < x["open"]
+            and trend == "Bearish"
+            and htf_bear
         )
+        reasons.append("Support/resistance reaction")
 
-        reason = "Reaction near recent support/resistance"
-
-    # 4. BREAKOUT
     elif strategy == "Breakout":
-        if len(df) >= 22:
-            previous_range = df.iloc[-21:-1]
-            range_high = float(previous_range["high"].max())
-            range_low = float(previous_range["low"].min())
+        prior = df.iloc[-21:-1]
+        range_high = float(prior["high"].max())
+        range_low = float(prior["low"].min())
 
-            buy = (
-                last["close"] > range_high
-                and last["close"] > last["open"]
-            )
-
-            sell = (
-                last["close"] < range_low
-                and last["close"] < last["open"]
-            )
-
-            reason = "Close beyond previous 20-candle range"
+        buy = (
+            x["close"] > range_high
+            and x["close"] > x["open"]
+            and trend == "Bullish"
+            and htf_bull
+            and body_ratio >= 0.55
+        )
+        sell = (
+            x["close"] < range_low
+            and x["close"] < x["open"]
+            and trend == "Bearish"
+            and htf_bear
+            and body_ratio >= 0.55
+        )
+        reasons.append("Range breakout")
 
     if buy and sell:
-        result["Reason"] = "Conflicting conditions; no signal"
-        return result
+        out["Reason"] = "Conflicting direction"
+        return out
 
     if not buy and not sell:
-        result["Reason"] = reason + " — conditions not met"
-        return result
+        out["Reason"] = "No confirmed trigger"
+        return out
 
-    # ATR-based stop and targets.
-    # These are theoretical levels, not broker-validated orders.
-    stop_distance = max(atr * 1.5, price * 0.0005)
+    direction = "BUY" if buy else "SELL"
 
-    if buy:
-        entry = price
-        stop = entry - stop_distance
-        direction = 1
-        result["Signal"] = "BUY"
-    else:
-        entry = price
-        stop = entry + stop_distance
-        direction = -1
-        result["Signal"] = "SELL"
+    # Reject countertrend setups.
+    if direction == "BUY" and not htf_bull:
+        out["Reason"] = "Higher timeframes do not confirm BUY"
+        return out
+    if direction == "SELL" and not htf_bear:
+        out["Reason"] = "Higher timeframes do not confirm SELL"
+        return out
 
+    # RSI must confirm momentum without being too extended.
+    momentum_ok = (
+        50 <= rsi <= 70 if direction == "BUY"
+        else 30 <= rsi <= 50
+    )
+
+    # Avoid weak trigger candles.
+    trigger_ok = body_ratio >= 0.40
+
+    if not volatility_ok:
+        out["Reason"] = "Volatility outside filter"
+        return out
+    if not candle_size_ok:
+        out["Reason"] = "Signal candle is unusually large"
+        return out
+    if not momentum_ok:
+        out["Reason"] = f"RSI momentum not confirmed ({rsi:.1f})"
+        return out
+    if not trigger_ok:
+        out["Reason"] = "Trigger candle body is too weak"
+        return out
+
+    # Score the candidate.
+    score = 0
+    score += 25  # Trigger exists.
+    score += 20 if trend == (
+        "Bullish" if direction == "BUY" else "Bearish"
+    ) else 0
+    score += 20 if (
+        htf_bull if direction == "BUY" else htf_bear
+    ) else 0
+    score += 15 if momentum_ok else 0
+    score += 10 if body_ratio >= 0.55 else 5
+    score += 10 if volatility_ok and candle_size_ok else 0
+
+    # ATR-based provisional stop. It is not broker-specific.
+    entry = price
+    stop_distance = max(1.5 * atr, price * 0.0005)
+    stop = entry - stop_distance if direction == "BUY" else entry + stop_distance
     risk = abs(entry - stop)
 
-    result["Entry"] = entry
-    result["Stop Loss"] = stop
-    result["TP1"] = entry + direction * risk
-    result["TP2"] = entry + direction * rr_target * risk
-    result["TP3"] = entry + direction * 3 * risk
-    result["Reason"] = reason
+    # TP1, TP2 and TP3 at 1R, 2R and 3R.
+    sign = 1 if direction == "BUY" else -1
+    tp1 = entry + sign * risk
+    tp2 = entry + sign * 2 * risk
+    tp3 = entry + sign * 3 * risk
+    rr = abs(tp2 - entry) / risk if risk else 0
 
-    return result
+    if rr < min_rr:
+        out["Reason"] = "Reward-to-risk requirement not met"
+        return out
+
+    out.update({
+        "Signal": direction,
+        "Score": score,
+        "Quality": (
+            "A — Strong filter match" if score >= 85
+            else "B — Moderate filter match" if score >= 75
+            else "Rejected"
+        ),
+        "Entry": entry,
+        "Stop Loss": stop,
+        "TP1": tp1,
+        "TP2": tp2,
+        "TP3": tp3,
+        "RR": rr,
+        "Reason": "; ".join(reasons) + f"; RSI {rsi:.1f}",
+    })
+
+    return out
 
 
 # =========================================================
-# SIDEBAR CONTROLS
+# SIDEBAR
 # =========================================================
 st.sidebar.title("Gold Signal AI")
-st.sidebar.caption("XAUUSD multi-timeframe scanner")
+st.sidebar.caption("Selective XAUUSD setup scanner")
 
 selected_timeframes = st.sidebar.multiselect(
     "Timeframes",
-    options=list(TIMEFRAMES.keys()),
+    list(TIMEFRAMES.keys()),
     default=list(TIMEFRAMES.keys()),
 )
 
 selected_strategies = st.sidebar.multiselect(
     "Strategies",
-    options=STRATEGIES,
+    STRATEGIES,
     default=STRATEGIES,
 )
 
-rr_target = st.sidebar.slider(
-    "Risk-to-reward target for TP2",
+min_score = st.sidebar.slider(
+    "Minimum setup score",
+    min_value=60,
+    max_value=100,
+    value=75,
+    step=5,
+)
+
+min_rr = st.sidebar.slider(
+    "Minimum risk-to-reward",
     min_value=1.0,
-    max_value=5.0,
+    max_value=4.0,
     value=2.0,
     step=0.5,
 )
@@ -470,376 +515,372 @@ rr_target = st.sidebar.slider(
 st.sidebar.divider()
 st.sidebar.subheader("Risk planning")
 
-account_balance = st.sidebar.number_input(
+balance = st.sidebar.number_input(
     "Account balance (USD)",
     min_value=0.0,
     value=100.0,
     step=10.0,
 )
 
-risk_percent = st.sidebar.slider(
+risk_pct = st.sidebar.slider(
     "Risk per trade (%)",
-    min_value=0.1,
-    max_value=5.0,
-    value=1.0,
-    step=0.1,
+    0.1, 5.0, 1.0, 0.1,
 )
-
-risk_budget = account_balance * risk_percent / 100
 
 st.sidebar.metric(
     "Planned risk budget",
-    f"${risk_budget:.2f}",
+    f"${balance * risk_pct / 100:.2f}",
 )
 
 st.sidebar.caption(
-    "Risk budget only. Lot sizing is not calculated. "
-    "Actual risk depends on broker contract specifications, "
-    "spread, slippage and execution."
+    "Budget only; not a lot-size calculation. "
+    "Verify broker contract specifications."
 )
 
 st.sidebar.caption("Auto-refresh: 10 seconds")
 
+
 # =========================================================
-# DASHBOARD HEADER
+# HEADER / QUOTE
 # =========================================================
 st.title("Gold Signal AI")
 st.caption(
-    "XAUUSD | Multi-timeframe technical scanner | "
-    "Signals only — no trades are placed"
+    "High-selectivity technical scanner | Signals only | "
+    "No automatic trade execution"
 )
 
-# =========================================================
-# LIVE QUOTE
-# =========================================================
-price, quote_error = fetch_live_quote()
+price, quote_error = fetch_quote()
 
-header_col1, header_col2, header_col3 = st.columns(3)
-
-with header_col1:
-    if price is not None:
-        st.metric("Latest XAUUSD quote", f"${price:,.2f}")
-    else:
-        st.metric("Latest XAUUSD quote", "Unavailable")
-
-with header_col2:
-    st.metric("Timeframes selected", len(selected_timeframes))
-
-with header_col3:
-    st.metric("Strategies selected", len(selected_strategies))
+c1, c2, c3 = st.columns(3)
+c1.metric(
+    "Latest XAUUSD quote",
+    f"${price:,.2f}" if price is not None else "Unavailable",
+)
+c2.metric("Selected timeframes", len(selected_timeframes))
+c3.metric("Minimum score", f"{min_score}/100")
 
 if quote_error:
     st.warning(f"Live quote unavailable: {quote_error}")
 
 st.caption(
-    "Latest refresh (UTC): "
+    "Last scan (UTC): "
     + datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 )
 
 st.divider()
 
-# =========================================================
-# FETCH ALL SELECTED TIMEFRAMES
-# =========================================================
-if not selected_timeframes:
-    st.info("Select at least one timeframe from the sidebar.")
-
-if not selected_strategies:
-    st.info("Select at least one strategy from the sidebar.")
-
-data_by_timeframe = {}
-errors_by_timeframe = {}
-trend_rows = []
-result_rows = []
-
-with st.spinner("Fetching candles and scanning strategies..."):
-    for timeframe in selected_timeframes:
-        interval = TIMEFRAMES[timeframe]
-        candles, error = fetch_candles(interval)
-
-        if error:
-            errors_by_timeframe[timeframe] = error
-
-        if candles.empty:
-            data_by_timeframe[timeframe] = candles
-
-            for strategy in selected_strategies:
-                result_rows.append({
-                    "Timeframe": timeframe,
-                    "Strategy": strategy,
-                    "Signal": "ERROR",
-                    "Trend": "Unknown",
-                    "Entry": None,
-                    "Stop Loss": None,
-                    "TP1": None,
-                    "TP2": None,
-                    "TP3": None,
-                    "Reason": error or "No candle data",
-                })
-
-            trend_rows.append({
-                "Timeframe": timeframe,
-                "Trend": "Unknown",
-                "Last Close": None,
-                "Candles": 0,
-                "Status": error or "No candle data",
-            })
-            continue
-
-        data_by_timeframe[timeframe] = candles
-        enriched = add_indicators(candles)
-        data_by_timeframe[timeframe] = enriched
-
-        trend_rows.append({
-            "Timeframe": timeframe,
-            "Trend": get_trend(enriched),
-            "Last Close": float(enriched["close"].iloc[-1]),
-            "Candles": len(enriched),
-            "Status": "OK",
-        })
-
-        for strategy in selected_strategies:
-            outcome = evaluate_strategy(
-                enriched,
-                strategy,
-                rr_target=rr_target,
-            )
-
-            result_rows.append({
-                "Timeframe": timeframe,
-                "Strategy": strategy,
-                "Signal": outcome["Signal"],
-                "Trend": outcome["Trend"],
-                "Entry": outcome["Entry"],
-                "Stop Loss": outcome["Stop Loss"],
-                "TP1": outcome["TP1"],
-                "TP2": outcome["TP2"],
-                "TP3": outcome["TP3"],
-                "Reason": outcome["Reason"],
-            })
 
 # =========================================================
-# DATA WARNINGS
+# FETCH CANDLES FOR SELECTED TIMEFRAMES
 # =========================================================
-if errors_by_timeframe:
-    with st.expander(
-        f"Data warnings ({len(errors_by_timeframe)})",
-        expanded=True,
-    ):
-        for timeframe, error in errors_by_timeframe.items():
-            st.warning(f"{timeframe}: {error}")
+data = {}
+data_errors = {}
+trends = {}
 
-# =========================================================
-# SUMMARY METRICS
-# =========================================================
-results_df = pd.DataFrame(result_rows)
+for tf in selected_timeframes:
+    candles, error = fetch_candles(TIMEFRAMES[tf])
 
-if not results_df.empty:
-    buy_count = int((results_df["Signal"] == "BUY").sum())
-    sell_count = int((results_df["Signal"] == "SELL").sum())
-    wait_count = int((results_df["Signal"] == "WAIT").sum())
-    error_count = int((results_df["Signal"] == "ERROR").sum())
-else:
-    buy_count = sell_count = wait_count = error_count = 0
+    if error:
+        data_errors[tf] = error
+        data[tf] = pd.DataFrame()
+        trends[tf] = "Unknown"
+    else:
+        data[tf] = add_indicators(candles)
+        trends[tf] = trend_of(data[tf])
 
-metric1, metric2, metric3, metric4 = st.columns(4)
+# Use H4/H1 as the primary directional context.
+# If either context timeframe is unavailable, do not pretend it agrees.
+context_trends = [
+    trends.get("H4", "Unknown"),
+    trends.get("H1", "Unknown"),
+]
 
-metric1.metric("BUY setups", buy_count)
-metric2.metric("SELL setups", sell_count)
-metric3.metric("WAIT", wait_count)
-metric4.metric("Data errors", error_count)
-
-# =========================================================
-# ALL STRATEGY RESULTS
-# =========================================================
-st.subheader("All strategy results")
-
-def format_price(value):
-    if value is None or pd.isna(value):
-        return "—"
-    try:
-        return f"{float(value):,.2f}"
-    except (TypeError, ValueError):
-        return "—"
-
-
-if not results_df.empty:
-    display_df = results_df.copy()
-
-    for column in ["Entry", "Stop Loss", "TP1", "TP2", "TP3"]:
-        display_df[column] = display_df[column].apply(format_price)
-
-    st.dataframe(
-        display_df,
-        use_container_width=True,
-        hide_index=True,
+if "H4" not in selected_timeframes or "H1" not in selected_timeframes:
+    context_warning = (
+        "Select H1 and H4 for full higher-timeframe confirmation."
     )
 else:
-    st.info("Select at least one timeframe and strategy.")
+    context_warning = None
+
+if context_warning:
+    st.info(context_warning)
+
+if data_errors:
+    with st.expander(
+        f"Data warnings ({len(data_errors)})",
+        expanded=True,
+    ):
+        for tf, message in data_errors.items():
+            st.warning(f"{tf}: {message}")
+
 
 # =========================================================
-# DETECTED SETUPS
+# SCAN STRATEGIES
 # =========================================================
-st.subheader("Detected setups")
+rows = []
 
-if not results_df.empty:
-    signals_df = results_df[
-        results_df["Signal"].isin(["BUY", "SELL"])
-    ].copy()
+for tf in selected_timeframes:
+    df = data.get(tf, pd.DataFrame())
 
-    if signals_df.empty:
-        if error_count:
-            st.warning(
-                "No signals can be confirmed while data errors remain. "
-                "Check the Data warnings section."
-            )
+    for strategy in selected_strategies:
+        if df.empty:
+            outcome = {
+                "Signal": "ERROR",
+                "Score": 0,
+                "Quality": "Unavailable",
+                "Trend": "Unknown",
+                "Entry": None,
+                "Stop Loss": None,
+                "TP1": None,
+                "TP2": None,
+                "TP3": None,
+                "RR": None,
+                "Reason": data_errors.get(tf, "No data"),
+            }
         else:
-            st.info(
-                "No qualifying setups detected. WAIT means the "
-                "selected rules were not met."
+            # Exclude the chart's own timeframe from the context vote.
+            other_context = [
+                trends.get(context_tf, "Unknown")
+                for context_tf in ["H4", "H1"]
+                if context_tf != tf
+            ]
+
+            # H4/H1 themselves still need the other context timeframe.
+            outcome = score_setup(
+                df,
+                strategy,
+                other_context,
+                min_rr=min_rr,
             )
+
+            # Strictly require both H4 and H1 to agree for a qualifying setup.
+            h4 = trends.get("H4", "Unknown")
+            h1 = trends.get("H1", "Unknown")
+
+            if outcome["Signal"] in ["BUY", "SELL"]:
+                required_trend = (
+                    "Bullish" if outcome["Signal"] == "BUY"
+                    else "Bearish"
+                )
+
+                if h4 != required_trend or h1 != required_trend:
+                    outcome["Signal"] = "WAIT"
+                    outcome["Quality"] = "Rejected"
+                    outcome["Reason"] = (
+                        "H1 and H4 must both agree with direction"
+                    )
+
+        # A score is a ranking of rule matches, not a probability.
+        if outcome["Signal"] in ["BUY", "SELL"]:
+            if outcome["Score"] < min_score:
+                outcome["Signal"] = "WAIT"
+                outcome["Quality"] = "Rejected"
+                outcome["Reason"] = (
+                    f"Score {outcome['Score']} below minimum {min_score}"
+                )
+
+        rows.append({
+            "Timeframe": tf,
+            "Strategy": strategy,
+            **outcome,
+        })
+
+results = pd.DataFrame(rows)
+
+
+# =========================================================
+# SUMMARY
+# =========================================================
+if results.empty:
+    buys = sells = waits = errors = 0
+else:
+    buys = int((results["Signal"] == "BUY").sum())
+    sells = int((results["Signal"] == "SELL").sum())
+    waits = int((results["Signal"] == "WAIT").sum())
+    errors = int((results["Signal"] == "ERROR").sum())
+
+m1, m2, m3, m4 = st.columns(4)
+m1.metric("Qualified BUY", buys)
+m2.metric("Qualified SELL", sells)
+m3.metric("WAIT / Rejected", waits)
+m4.metric("Data errors", errors)
+
+
+# =========================================================
+# HIGH-QUALITY SETUPS
+# =========================================================
+st.subheader("High-quality setups")
+
+if results.empty:
+    st.info("Choose at least one timeframe and strategy.")
+else:
+    qualified = results[
+        results["Signal"].isin(["BUY", "SELL"])
+    ].sort_values("Score", ascending=False)
+
+    if qualified.empty:
+        st.info(
+            "No setups currently meet your quality filters. "
+            "This is expected when conditions are unclear. "
+            "Check data warnings before interpreting the result."
+        )
     else:
-        for _, signal in signals_df.iterrows():
+        for _, row in qualified.iterrows():
             with st.container(border=True):
                 st.markdown(
-                    f"**{signal['Signal']} — {signal['Timeframe']} — "
-                    f"{signal['Strategy']}**"
+                    f"**{row['Signal']} | {row['Timeframe']} | "
+                    f"{row['Strategy']}**"
+                )
+
+                st.progress(
+                    min(max(float(row["Score"]) / 100, 0), 1),
+                    text=(
+                        f"Rule-match score: {row['Score']}/100 — "
+                        f"{row['Quality']}"
+                    ),
                 )
 
                 a, b, c, d, e = st.columns(5)
-                a.metric("Entry", format_price(signal["Entry"]))
-                b.metric("Stop Loss", format_price(signal["Stop Loss"]))
-                c.metric("TP1", format_price(signal["TP1"]))
-                d.metric("TP2", format_price(signal["TP2"]))
-                e.metric("TP3", format_price(signal["TP3"]))
+                a.metric("Entry", f"{row['Entry']:.2f}")
+                b.metric("Stop Loss", f"{row['Stop Loss']:.2f}")
+                c.metric("TP1", f"{row['TP1']:.2f}")
+                d.metric("TP2", f"{row['TP2']:.2f}")
+                e.metric("TP3", f"{row['TP3']:.2f}")
 
                 st.caption(
-                    f"Trend: {signal['Trend']} | "
-                    f"Reason: {signal['Reason']}"
+                    f"Trend: {row['Trend']} | "
+                    f"Planned TP2 R:R: {row['RR']:.1f}:1 | "
+                    f"{row['Reason']}"
                 )
+
+
+# =========================================================
+# ALL SCAN RESULTS
+# =========================================================
+st.subheader("All strategy results")
+
+if not results.empty:
+    display = results.copy()
+
+    for col in ["Entry", "Stop Loss", "TP1", "TP2", "TP3"]:
+        display[col] = display[col].apply(
+            lambda x: f"{float(x):.2f}"
+            if pd.notna(x) else "—"
+        )
+
+    display["RR"] = display["RR"].apply(
+        lambda x: f"{float(x):.1f}:1"
+        if pd.notna(x) else "—"
+    )
+
+    st.dataframe(display, use_container_width=True, hide_index=True)
+
 
 # =========================================================
 # TREND OVERVIEW
 # =========================================================
 st.subheader("Trend overview")
 
-trend_df = pd.DataFrame(trend_rows)
+trend_rows = []
 
-if not trend_df.empty:
-    if "Last Close" in trend_df.columns:
-        trend_df["Last Close"] = trend_df["Last Close"].apply(
-            format_price
-        )
+for tf in selected_timeframes:
+    df = data.get(tf, pd.DataFrame())
 
+    trend_rows.append({
+        "Timeframe": tf,
+        "Trend": trends.get(tf, "Unknown"),
+        "Latest close": (
+            round(float(df["close"].iloc[-1]), 2)
+            if not df.empty else None
+        ),
+        "Candles": len(df),
+        "Status": "OK" if not df.empty else "ERROR",
+    })
+
+if trend_rows:
     st.dataframe(
-        trend_df,
+        pd.DataFrame(trend_rows),
         use_container_width=True,
         hide_index=True,
     )
-else:
-    st.info("No timeframe data to display.")
+
 
 # =========================================================
 # CANDLESTICK CHART
 # =========================================================
 st.subheader("Candlestick chart")
 
-chart_timeframe = st.selectbox(
-    "Chart timeframe",
-    options=selected_timeframes if selected_timeframes else ["M5"],
-    index=0,
-)
-
-chart_df = data_by_timeframe.get(
-    chart_timeframe, pd.DataFrame()
-)
-
-if chart_df.empty:
-    st.warning(
-        f"No chart available for {chart_timeframe}. "
-        "Resolve its data warning above."
+if selected_timeframes:
+    chart_tf = st.selectbox(
+        "Chart timeframe",
+        selected_timeframes,
     )
-else:
-    chart_data = chart_df.tail(150).copy()
 
-    fig = go.Figure()
+    chart_df = data.get(chart_tf, pd.DataFrame())
 
-    fig.add_trace(
-        go.Candlestick(
-            x=chart_data["time"],
-            open=chart_data["open"],
-            high=chart_data["high"],
-            low=chart_data["low"],
-            close=chart_data["close"],
+    if chart_df.empty:
+        st.warning("Chart unavailable because candle data is missing.")
+    else:
+        chart_df = chart_df.tail(150)
+
+        fig = go.Figure()
+
+        fig.add_trace(go.Candlestick(
+            x=chart_df["time"],
+            open=chart_df["open"],
+            high=chart_df["high"],
+            low=chart_df["low"],
+            close=chart_df["close"],
             name="XAUUSD",
             increasing_line_color="#36d6a0",
             decreasing_line_color="#ff5b78",
-        )
-    )
+        ))
 
-    fig.add_trace(
-        go.Scatter(
-            x=chart_data["time"],
-            y=chart_data["ema20"],
+        fig.add_trace(go.Scatter(
+            x=chart_df["time"],
+            y=chart_df["ema20"],
             mode="lines",
             name="EMA 20",
             line=dict(color="#a78bfa", width=1.4),
-        )
-    )
+        ))
 
-    fig.add_trace(
-        go.Scatter(
-            x=chart_data["time"],
-            y=chart_data["ema50"],
+        fig.add_trace(go.Scatter(
+            x=chart_df["time"],
+            y=chart_df["ema50"],
             mode="lines",
             name="EMA 50",
             line=dict(color="#f4b860", width=1.4),
+        ))
+
+        fig.update_layout(
+            template="plotly_dark",
+            paper_bgcolor="#0b0913",
+            plot_bgcolor="#110d1c",
+            font=dict(color="#e8e0f5"),
+            height=580,
+            xaxis_rangeslider_visible=False,
+            margin=dict(l=10, r=10, t=30, b=10),
         )
-    )
 
-    fig.update_layout(
-        template="plotly_dark",
-        paper_bgcolor="#0b0913",
-        plot_bgcolor="#110d1c",
-        font=dict(color="#e8e0f5"),
-        height=600,
-        xaxis_rangeslider_visible=False,
-        margin=dict(l=10, r=10, t=30, b=10),
-        legend=dict(orientation="h", y=1.02, x=0),
-    )
+        fig.update_xaxes(gridcolor="#292137")
+        fig.update_yaxes(gridcolor="#292137", side="right")
 
-    fig.update_xaxes(
-        showgrid=True,
-        gridcolor="#292137",
-    )
+        st.plotly_chart(fig, use_container_width=True)
 
-    fig.update_yaxes(
-        showgrid=True,
-        gridcolor="#292137",
-        side="right",
-    )
-
-    st.plotly_chart(fig, use_container_width=True)
 
 # =========================================================
-# FOOTER
+# FOOTER AND AUTO REFRESH
 # =========================================================
 st.divider()
-
 st.caption(
-    "Experimental technical-rule scanner. Signals are based on "
-    "completed candles and simple indicators. This is not financial "
-    "advice. It does not account for broker-specific spreads, slippage, "
-    "contract specifications, execution, or news volatility. "
-    "Verify data and test the rules before risking real money."
+    "Experimental rules-based scanner. The score is not a win "
+    "probability. Signals are not validated trading advice and do "
+    "not account for news, spread, slippage, execution or broker "
+    "contract specifications. Backtest and demo-test before use."
 )
 
-# =========================================================
-# AUTO REFRESH
-# =========================================================
-# Streamlit 1.50 supports fragments with automatic reruns.
 @st.fragment(run_every="10s")
-def refresh_notice():
-    st.caption("Automatic refresh is enabled (10 seconds).")
+def refresh_status():
+    st.caption("Auto-refresh enabled: 10 seconds.")
 
-refresh_notice()
+refresh_status()
